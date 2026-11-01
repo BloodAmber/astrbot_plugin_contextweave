@@ -1,0 +1,204 @@
+from astrbot.api.all import *
+from typing import Dict, Any, Optional
+import random
+import time
+from .llm_utils import LLMUtils
+
+class ReplyDecision:
+    """
+    消息回复决策工具类
+    用于判断是否要使用大模型回复消息
+    """
+    
+    @staticmethod
+    def should_reply(event: AstrMessageEvent, config: AstrBotConfig) -> bool:
+        """
+        判断是否应该回复消息
+        
+        Args:
+            event: 消息事件
+            config: 配置对象
+            
+        Returns:
+            是否应该回复
+        """
+        try:
+            # 获取必要信息
+            platform_name = event.get_platform_name()
+            is_private_chat = event.is_private_chat()
+            chat_id = event.get_sender_id() if is_private_chat else event.get_group_id()
+            
+            # 检查是否已有大模型在处理
+            if LLMUtils.is_llm_in_progress(platform_name, is_private_chat, chat_id):
+                logger.debug(f"当前聊天已有大模型处理中，不进行回复")
+                return False
+            
+            # 检查是否处于临时静默状态
+            mute_info = config.get("_temp_mute", {})
+            if mute_info and mute_info.get("until", 0) > time.time():
+                logger.debug(f"当前处于临时静默状态，不进行回复")
+                return False
+                
+            # 检查消息是否包含黑名单关键词
+            blacklist_keywords = config.get("model_frequency", {}).get("blacklist_keywords", [])
+            if blacklist_keywords and ReplyDecision._check_blacklist_keywords(event, blacklist_keywords):
+                logger.debug("消息中包含黑名单关键词，不进行回复")
+                return False
+            
+            # 检查配置中的回复规则
+            return ReplyDecision._check_reply_rules(event, config)
+        except Exception as e:
+            logger.error(f"判断是否回复时发生错误: {e}")
+            return False
+    
+    @staticmethod
+    def _check_reply_rules(event: AstrMessageEvent, config: AstrBotConfig) -> bool:
+        """
+        检查回复规则
+        
+        Args:
+            event: 消息事件
+            config: 配置对象
+            
+        Returns:
+            是否应该回复
+        """
+        # 检查是否是开启回复的群聊/私聊
+        if event.is_private_chat():
+            if not config.get("enabled_private", False):
+                logger.debug("未开启私聊回复功能")
+                return False
+        else:
+            group_id = event.get_group_id()
+            if not group_id:
+                logger.debug("群聊ID为空，不进行回复")
+                return False
+            group_id = str(group_id).strip()
+
+            # 获取配置集合并规范化类型 (O(1) 查找)
+            blocked_groups = {str(g).strip() for g in config.get("blocked_groups", []) if str(g).strip()}
+            enabled_groups = {str(g).strip() for g in config.get("enabled_groups", []) if str(g).strip()}
+
+            # 1. 黑名单检查 - 最高优先级
+            if group_id in blocked_groups:
+                logger.debug(f"群聊{group_id}在黑名单中，不进行回复")
+                return False
+
+            # 2. 全局开关检查
+            if config.get("enable_all_groups", False):
+                logger.debug(f"全局群聊回复已开启，允许回复群聊{group_id}")
+                # 继续执行下面的频率检查
+            elif group_id not in enabled_groups:
+                # 3. 白名单检查 (仅在全局开关关闭时)
+                logger.debug(f"群聊{group_id}未在白名单中，不进行回复")
+                return False
+            
+        # 获取消息频率配置
+        frequency_config = config.get("model_frequency", {})
+        # 检查关键词触发
+        keywords = frequency_config.get("keywords", [])
+        if keywords and ReplyDecision._check_keywords(event, keywords):
+            logger.debug("消息中包含关键词，触发回复")
+            event.set_extra('_contextweave_trigger', 'keyword')
+            return True
+        
+        # 获取回复方法
+        method = frequency_config.get("method", "概率回复")
+        
+        # 根据不同方法判断
+        if method == "概率回复":
+            prob_config = frequency_config.get("probability", {})
+            
+            # 私聊固定概率为1，群聊使用配置概率
+            if event.is_private_chat():
+                probability = 1.0  # 私聊总是回复
+                logger.debug("私聊消息，固定概率为1，总是回复")
+            else:
+                probability = prob_config.get("probability", 0.1)  # 群聊使用配置概率
+                logger.debug(f"群聊消息，使用配置概率: {probability}")
+            
+            # 使用概率计算是否回复
+            should_reply = random.random() < probability
+            if should_reply:
+                logger.debug(f"概率触发回复，当前概率: {probability}")
+                event.set_extra('_contextweave_trigger', 'probability')
+            else:
+                logger.debug(f"概率回复未触发，当前概率: {probability}")
+            return should_reply
+        
+        # 为未来扩展预留接口
+        # 可以在这里添加更多回复方法的判断逻辑
+        
+        return False
+    
+    @staticmethod
+    def _check_keywords(event: AstrMessageEvent, keywords: list) -> bool:
+        """
+        检查消息是否包含关键词
+        
+        Args:
+            event: 消息事件
+            keywords: 关键词列表
+            
+        Returns:
+            是否包含关键词
+        """
+        # 获取消息文本
+        message_text = event.get_message_outline()
+        
+        # 检查是否包含关键词
+        for keyword in keywords:
+            if keyword in message_text:
+                return True
+                
+        return False
+        
+    @staticmethod
+    def _check_blacklist_keywords(event: AstrMessageEvent, blacklist_keywords: list) -> bool:
+        """
+        检查消息是否包含黑名单关键词
+        
+        Args:
+            event: 消息事件
+            blacklist_keywords: 黑名单关键词列表
+            
+        Returns:
+            是否包含黑名单关键词
+        """
+        # 获取消息文本
+        message_text = event.get_message_outline()
+        
+        # 检查是否包含黑名单关键词
+        for keyword in blacklist_keywords:
+            if keyword in message_text:
+                return True
+                
+        return False
+
+    @staticmethod
+    async def process_and_reply(event: AstrMessageEvent, config: AstrBotConfig, context: Context):
+        """
+        处理消息并使用大模型回复
+        
+        Args:
+            event: 消息事件
+            config: 配置对象
+            context: 上下文对象
+            
+        Yields:
+            大模型的回复
+        """
+        # 获取必要信息
+        platform_name = event.get_platform_name()
+        is_private = event.is_private_chat()
+        chat_id = event.get_sender_id() if is_private else event.get_group_id()
+
+        # 标记开始处理
+        LLMUtils.set_llm_in_progress(platform_name, is_private, chat_id)
+
+        try:
+            # 调用大模型并发送回复
+            yield await LLMUtils.call_llm(event, config, context)
+        finally:
+            # 标记处理完成
+            LLMUtils.set_llm_in_progress(platform_name, is_private, chat_id, False)

@@ -1,0 +1,236 @@
+name: Prepare Release
+
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - 'changelogs/v*.md'
+
+concurrency:
+  group: prepare-release
+  cancel-in-progress: false
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Find new changelog file
+        id: find_changelog
+        run: |
+          # 获取本次推送中变更的 changelog 文件
+          CHANGELOG_FILE=$(git diff --name-only ${{ github.event.before }}..${{ github.sha }} -- 'changelogs/v*.md' | head -1 || true)
+
+          if [ -z "$CHANGELOG_FILE" ]; then
+            echo "No changelog file found in push range, checking added files..."
+            CHANGELOG_FILE=$(git diff --name-only --diff-filter=A ${{ github.event.before }}..${{ github.sha }} | grep '^changelogs/v.*\.md$' | head -1 || true)
+          fi
+
+          if [ -z "$CHANGELOG_FILE" ]; then
+            echo "No new changelog file found in commit"
+            exit 1
+          fi
+
+          if [ ! -f "$CHANGELOG_FILE" ]; then
+            echo "Changelog file does not exist: $CHANGELOG_FILE"
+            exit 1
+          fi
+
+          echo "changelog_file=$CHANGELOG_FILE" >> "$GITHUB_OUTPUT"
+          echo "Found changelog file: $CHANGELOG_FILE"
+
+      - name: Extract version from filename
+        id: version
+        run: |
+          CHANGELOG_FILE="${{ steps.find_changelog.outputs.changelog_file }}"
+
+          # 从文件名提取版本号 (changelogs/v2.1.8.md -> v2.1.8)
+          VERSION=$(basename "$CHANGELOG_FILE" .md)
+          VERSION_NO_V="${VERSION#v}"
+
+          # 验证版本格式
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]]; then
+            echo "Invalid version format: $VERSION"
+            echo "Expected format: vX.X.X or vX.X.X-suffix"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version_no_v=$VERSION_NO_V" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
+
+      - name: Check if tag already exists
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          git fetch --tags
+          if git tag -l "$VERSION" | grep -q .; then
+            echo "Error: Tag $VERSION already exists!"
+            exit 1
+          fi
+          echo "Tag $VERSION does not exist, proceeding..."
+
+      - name: Get current date
+        id: date
+        run: echo "date=$(date +'%Y-%m-%d')" >> "$GITHUB_OUTPUT"
+
+      - name: Read changelog content
+        id: changelog
+        run: |
+          CHANGELOG_FILE="${{ steps.find_changelog.outputs.changelog_file }}"
+
+          # 读取 changelog 内容并保存到临时文件
+          cat "$CHANGELOG_FILE" > /tmp/changelog_content.txt
+
+          # 存储到 output (使用 delimiter 处理多行)
+          {
+            echo 'content<<CHANGELOG_EOF'
+            cat "$CHANGELOG_FILE"
+            echo 'CHANGELOG_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Update metadata.yaml
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # 替换版本号，保留可能的注释
+          sed -i "s/^version: *v[^ #]*/version: $VERSION/" metadata.yaml
+
+          # 验证更新成功
+          if ! grep -q "^version: $VERSION" metadata.yaml; then
+            echo "Failed to update metadata.yaml"
+            exit 1
+          fi
+          echo "Updated metadata.yaml to version $VERSION"
+
+      - name: Update main.py
+        run: |
+          VERSION_NO_V="${{ steps.version.outputs.version_no_v }}"
+          # 更新 @register 装饰器中的版本号（支持预发布版本）
+          sed -i "s/\"[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\(-[a-zA-Z0-9.]*\)\{0,1\}\",/\"$VERSION_NO_V\",/" main.py
+
+          # 验证更新成功
+          if ! grep -q "\"$VERSION_NO_V\"," main.py; then
+            echo "Failed to update main.py"
+            exit 1
+          fi
+          echo "Updated main.py to version $VERSION_NO_V"
+
+      - name: Update README.md badge
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # 匹配 version-vX.X.X[-suffix]-blue，保留 -blue 颜色后缀
+          sed -i "s/version-v[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\(-[a-zA-Z0-9.]*\)\{0,1\}-blue/version-$VERSION-blue/" README.md
+
+          # 验证更新成功
+          if ! grep -q "version-$VERSION" README.md; then
+            echo "Failed to update README.md badge"
+            exit 1
+          fi
+          echo "Updated README.md badge to $VERSION"
+
+      - name: Update README.md latest version section
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          DATE="${{ steps.date.outputs.date }}"
+
+          # 创建新的"最新版本"section内容（不带前导空格）
+          {
+            echo "## 📋 最新版本"
+            echo ""
+            echo "### $VERSION ($DATE)"
+            echo ""
+            cat /tmp/changelog_content.txt
+            echo ""
+          } > /tmp/new_section.txt
+
+          # 使用 awk 替换 README 中的"最新版本"section
+          awk '
+            BEGIN { skip = 0 }
+            /^## 📋 最新版本/ {
+              skip = 1
+              while ((getline line < "/tmp/new_section.txt") > 0) print line
+              close("/tmp/new_section.txt")
+              next
+            }
+            /^## / && skip { skip = 0 }
+            !skip { print }
+          ' README.md > README.md.tmp && mv README.md.tmp README.md
+
+          echo "Updated README.md latest version section"
+
+      - name: Commit changes (amend to changelog commit)
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add metadata.yaml main.py README.md
+
+          # 检查是否有变更
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+
+          # 将 bump version 变更合并到 changelog 提交中
+          git commit --amend -m "release: $VERSION"
+          git push origin HEAD:dev --force-with-lease
+
+          echo "Amended changelog commit with version bump"
+
+      - name: Create Pull Request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # 创建 PR body
+          {
+            echo "## Release $VERSION"
+            echo ""
+            echo "This PR was automatically created by the release workflow."
+            echo ""
+            echo "### Changes"
+            cat /tmp/changelog_content.txt
+            echo ""
+            echo "### Files Updated"
+            echo "- \`metadata.yaml\` - version updated"
+            echo "- \`main.py\` - version in @register decorator updated"
+            echo "- \`README.md\` - badge and latest version section updated"
+            echo ""
+            echo "---"
+            echo "*After merging, a tag will be automatically created and a GitHub Release will be published.*"
+          } > /tmp/pr_body.md
+
+          # 检查是否已存在 dev -> main 的 PR
+          EXISTING_PR=$(gh pr list --base main --head dev --state open --json number --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING_PR" ]; then
+            echo "PR #$EXISTING_PR already exists for dev -> main, updating..."
+            gh pr edit "$EXISTING_PR" \
+              --title "Release $VERSION" \
+              --body-file /tmp/pr_body.md \
+              --add-label "release"
+            echo "Updated PR #$EXISTING_PR"
+            exit 0
+          fi
+
+          # 创建 PR
+          gh pr create \
+            --base main \
+            --head dev \
+            --title "Release $VERSION" \
+            --body-file /tmp/pr_body.md \
+            --label "release"
+
+          echo "Created PR for Release $VERSION"

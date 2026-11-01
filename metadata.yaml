@@ -1,0 +1,7 @@
+name: spectrecore
+display_name: ContextWeave · 群聊语境
+desc: 可切换概率或观察回复，统一会话、消息归属与主动接话
+help: 使用 /cw help；兼容 /sc 和 /spectrecore。保留原配置标识以便原位升级。
+version: v3.4.3
+author: 23q3 / local ContextWeave revision
+repo: https://github.com/BloodAmber/astrbot_plugin_contextweave
